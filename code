@@ -1,0 +1,919 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+from sklearn.tree import DecisionTreeClassifier,_tree
+from sklearn import metrics
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+
+def tree_split(df, col, target,max_bin,min_binpct,nan_value):
+    '''
+    决策树分箱
+    param：
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        max_bin:最大分箱数 int
+        min_binpct：箱体的最小占比 float
+        nan_value：缺失映射值 int/float
+    teturn：
+        split_list:分割点 list
+    '''
+    miss_value_rate = df[df[col] == nan_value].shape[0] / df.shape[0]
+    # 如果缺失占比小于5%，直接分箱
+    if miss_value_rate < 0.05:
+        x = np.array(df[col]).reshape(-1,1)    # reshape后：1D→2D narray
+        y = np.array(df[target])               # 1D
+#         设置模型参数
+        tree = DecisionTreeClassifier(max_leaf_nodes = max_bin,
+                                     min_samples_leaf = min_binpct)
+        tree.fit(x, y)
+        thresholds = tree.tree_.threshold
+        thresholds = thresholds[thresholds != _tree.TREE_UNDEFINED]
+        split_list = sorted(thresholds.tolist())
+    # 如果缺失占比大于5%，单独分箱
+    else:
+        max_bin2 = max_bin - 1
+        x = np.array(df[~(df[col] == nan_value)][col]).reshape(-1,1)
+        y = np.array(df[~(df[col] == nan_value)][target])
+        tree = DecisionTreeClassifier(max_leaf_nodes = max_bin2,
+                                     min_samples_leaf = min_binpct)
+        tree.fit(x,y)
+        thresholds = tree.tree_.threshold
+        thresholds = thresholds[thresholds != _tree.TREE_UNDEFINED]
+        split_list = sorted(thresholds.tolist())
+        split_list.insert(0, nan_value)
+    return split_list
+
+
+def quantile_split(df, col, target, max_bin, nan_value):
+    '''
+    等频分箱
+    param:
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        max_bin:最大分箱数 int
+        nan_value:缺失的映射值 int/float
+    return：
+        split_list:分割点 list
+    '''
+#     计算要分箱的特征的数据缺失率
+    miss_value_rate = df[df[col] == nan_value].shape[0] / df.shape[0]
+    
+#     如果缺失占比小于5%，直接分箱；否则把缺失的单独分为一箱，其余的再等频分箱
+    if miss_value_rate < 0.05:
+        bin_series, bin_cut = pd.qcut(df[col], q = max_bin, retbins = True, duplicates = 'drop')    # qcut：等频
+        split_list = bin_cut.tolist()    # tolist(): narray → list
+        split_list.remove(split_list[0])
+    else:
+        df2 = df[~(df[col] == nan_value)]
+        max_bin2 = max_bin - 1
+        bin_series, bin_cut = pd.qcut(df[col], q = max_bin2, retbins = True, duplicates = 'drop')
+        #bin_series,bin_cut = pd.qcut(df2[col],q=max_bin2,duplicates='drop',retbins=True)
+        split_list = bin_cut.tolist()
+        split_list[0] = nan_value
+    split_list.remove(split_list[-1])
+    
+    # 当出现某个箱体只有好用户或只有坏用户时，进行前向合并箱体
+    var_arr = np.array(df[col])
+    target_arr = np.array(df[target])
+    bin_trans = np.digitize(var_arr, split_list, right = True)    # 把array按照cut分箱，right = True左开右闭
+    var_tuple = [(x, y) for x, y in zip(bin_trans, target_arr)]
+    
+    delete_cut_list = []
+    for i in set(bin_trans):
+        target_list = [y for x, y in var_tuple if x == i]
+        if target_list.count(0) == 0 or target_list.count(1) == 0:
+            if i == min(bin_trans):
+                index = i
+            else:
+                index = i - 1
+            delete_cut_list.append(split_list[index])    # 第一箱向后靠，其余箱向前靠；区别于梅子行：向WOE小的靠
+    
+    split_list = [x for x in split_list if x not in delete_cut_list]
+    
+    return split_list
+
+def cal_woe(df, col, target, nan_value, cut = None):
+    '''
+    计算woe
+    param:
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        nan_value：缺失的映射值 int/float
+        cut:箱体分割点 list
+        
+    return：
+        woe_list:每个箱体的woe list
+    '''
+    # 计算总体好坏个数
+    total = df[target].count()
+    bad = df[target].sum()
+    good = total - bad
+    
+    # 分箱
+    bucket = pd.cut(df[col], cut)
+    group = df.groupby(bucket)
+    
+    # 计算woe
+    bin_df = pd.DataFrame()
+    bin_df['total'] = group[target].count()
+    bin_df['bad'] = group[target].sum()
+    bin_df['good'] = bin_df['total'] - bin_df['bad']
+    bin_df['bad_attr'] = bin_df['bad'] / bad
+    bin_df['good_attr'] = bin_df['good'] / good
+    bin_df['woe'] = np.log(bin_df['bad_attr'] / bin_df['good_attr'])
+    
+    # 如果cut中有nan_value，说明有缺失值箱，后续‘单调分箱’时，不考虑其woe值
+    
+    if nan_value in cut:
+        woe_list = bin_df['woe'].tolist()[1:]
+    else:
+        woe_list = bin_df['woe'].tolist()
+    return woe_list
+
+def judge_increasing(L):
+    '''
+    判断list是否单调递增
+    '''
+    return all(x<y for x,y in zip(L, L[1:]))    # all()：没有元素是空/false/''，或iterabel==[]空列表/()空元组
+
+def judge_decreasing(L):
+    '''
+    判断list是否单调递减
+    '''
+    return all(x>y for x,y in zip(L, L[1:]))
+
+def monot_trim(df, col, target, nan_value, cut = None):
+    '''
+    woe调整成单调递减或单调递增
+    param:
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        nan_value:缺失的映射值 int/float
+        cut：箱体分割点 list
+        
+    return：
+        new_cut：调整后的分割点 list
+    '''
+    woe_list = cal_woe(df, col, target, nan_value, cut = cut)
+    
+    # 若第一箱的woe>0，则应该单调递减
+    if woe_list[0] > 0:
+        while not judge_decreasing(woe_list):
+            # 找出没有单调递减的箱子
+            judge_list = [x>y for x,y in zip(woe_list, woe_list[1:])]
+            # 向前合并，找出需要剔除的分割点的索引，如果有缺失映射值，索引+1
+            if nan_value in cut:
+                index_list = [i+2 for i,j in enumerate(judge_list) if j == False]
+            else:
+                index_list = [i+1 for i,j in enumerate(judge_list) if j == False]
+            new_cut = [j for i,j in enumerate(cut) if i not in index_list]
+            woe_list = cal_woe(df,col,target,nan_value,cut = new_cut)
+        
+    # 若第一箱的woe<0，则应该单调递增
+    elif woe_list[0] < 0:
+        while not judge_increasing(woe_list):
+            judge_list = [x<y for x,y in zip(woe_list, woe_list[1:])]
+            if nan_value in cut:
+                index_list = [i+2 for i,j in enumerate(judge_list) if j == False]
+            else:
+                index_list = [i+1 for i,j in enumerate(judge_list) if j == False]
+            new_cut = [j for i,j in enumerate(cut) if i not in index_list]
+            woe_list = cal_woe(df,col,target,nan_value,cut = new_cut)
+    return new_cut
+
+def binning_var(df,col,target,bin_type='dt',max_bin=5,min_binpct=0.05,nan_value = -999):
+    '''
+    特征分箱，计算iv
+    param：
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        bin_type：分箱方式 默认是 'dt'，还有'quantitle'
+        max_bin：最大分箱数 int
+        min_binpct：箱体的最小占比 float
+        nan_value：缺失映射值int/float
+        
+    ruturn：
+        bin_df:特征的分箱明细表 DataFrame
+        cut：分割点
+        
+    '''
+    total = df[target].count()
+    bad = df[target].sum()
+    good = total - bad
+    
+    # 离散类特征
+    if df[col].dtype == np.dtype('object') or df[col].dtype == np.dtype('bool') or df[col].nunique() <= max_bin:
+        group = df.groupby(col,as_index = True)
+        bin_df = pd.DataFrame()
+        
+        bin_df['total'] = group[target].count()
+        bin_df['bad'] = group[target].sum()
+        bin_df['good'] = bin_df['total'] - bin_df['bad']
+        bin_df['total_rate'] = bin_df['total'] / total
+        bin_df['bad_rate'] = bin_df['bad'] / bin_df['total']
+        bin_df['good_rate'] = bin_df['good'] / bin_df['total']
+        bin_df['bad_attr'] = bin_df['bad'] / bad
+        bin_df['good_attr'] = bin_df['good'] / good
+        bin_df['woe'] = np.log(bin_df['bad_attr'] / bin_df['good_attr'])
+        bin_df['bin_iv'] = (bin_df['bad_attr'] - bin_df['good_attr']) * bin_df['woe']
+        bin_df['iv'] = bin_df['bin_iv'].sum()
+        cut = df[col].unique().tolist()
+        
+    # 连续性特征
+    else:
+        if bin_type == 'dt':
+            cut = tree_split(df, col, target, max_bin, min_binpct, nan_value)
+        elif bin_type == 'quantile':
+            cut = quantile_split(df, col, target, max_bin, nan_value)
+        cut.insert(0, float('-inf'))    # 负无穷
+        cut.append(float('inf'))    # 正无穷
+        
+        bucket = pd.cut(df[col], cut)
+        group = df.groupby(bucket)
+        bin_df = pd.DataFrame()
+        
+        bin_df['total'] = group[target].count()
+        bin_df['bad'] = group[target].sum()
+        bin_df['good'] = bin_df['total'] - bin_df['bad']
+        bin_df['total_rate'] = bin_df['total'] / total
+        bin_df['bad_rate'] = bin_df['bad'] / bin_df['total']
+        bin_df['good_rate'] = bin_df['good'] / bin_df['total']
+        bin_df['bad_attr'] = bin_df['bad'] / bad
+        bin_df['good_attr'] = bin_df['good'] / good
+        bin_df['woe'] = np.log(bin_df['bad_attr'] / bin_df['good_attr'])
+        bin_df['bin_iv'] = (bin_df['bad_attr'] - bin_df['good_attr']) * bin_df['woe']
+        bin_df['iv'] = bin_df['bin_iv'].sum()
+        
+        
+    return bin_df, cut
+
+def binning_trim(df, col, target, cut, right_border = True):
+    '''
+    调整woe单调后的分箱，并计算iv
+    params：
+        df：数据集 DataFrame
+        col：分箱的字段名 string
+        target：标签的字段名 string
+        cut：分割点 list
+        tighe_border：箱体的有边界是否闭合 bool
+    return：
+        bin_df：特征的分箱明细表 DataFrame
+    '''
+    total = df[target].count()
+    bad = df[target].sum()
+    good = total-bad    
+    bucket = pd.cut(df[col], cut,right = right_border)
+    
+    group = df.groupby(bucket)
+    bin_df = pd.DataFrame()
+    
+    bin_df['total'] = group['target'].count()
+    bin_df['bad'] = group['target'].sum()
+    bin_df['good'] = bin_df['total'] - bin_df['bad']
+    bin_df['total_rate'] = bin_df['total'] / total
+    bin_df['bad_rate'] = bin_df['bad'] / bin_df['total']
+    bin_df['good_rate'] = bin_df['good'] / bin_df['total']
+    bin_df['bad_attr'] = bin_df['bad'] / bad
+    bin_df['good_attr'] = bin_df['good'] / good
+    bin_df['woe'] = np.log(bin_df['bad_attr'] / bin_df['good_attr'])
+    bin_df['bin_iv'] = (bin_df['bad_attr'] - bin_df['good_attr']) * bin_df['woe']
+    bin_df['iv'] = bin_df['bin_iv'].sum()
+    
+    return bin_df
+
+def forward_corr_delete(df, col_list):
+    '''
+    筛选相关性，阈值定为0.65
+    params：
+        df：数据集 DataFrame
+        col_list：需要进行筛选的特征名，并且按照iv值从大到小排列好 list
+    return：
+        select_corr_list：筛选后的特征名 list
+    '''
+    #corr_list = col_list[0]     不能直接这样写，否则type(coor_list) = str
+    corr_list = []
+    corr_list.append(col_list[0])
+    delete_col = []
+    for col in col_list[1:]:
+        corr_list.append(col)
+        corr = df.loc[:, corr_list].corr()
+        corr_value_outself = [j for i,j in zip(corr[col].index, corr[col].values) if i != col]
+        if len([i for i in corr_value_outself if abs(i) >= 0.65]) >0:    # 要abs，因为corr有正负
+            delete_col.append(col)
+            
+    select_corr_list = [i for i in col_list if i not in delete_col]
+    return select_corr_list
+            
+def vif_delete(df, list_corr):
+    '''
+    多重共线性筛选，阈值定位10
+    VIF的取值大于1。VIF值越接近于1，多重共线性越轻，反之越重
+    params：
+        df：数据集 DataFrame
+        list_corr：经相关性筛选后的特征名，并按照iv值从大到小排列好 list
+    return：
+        corr_list:经多重共线性筛选后的特征名 list
+    '''
+    col_list = list_corr.copy()
+    # 计算出各个特征的vif
+    vif_matrix = np.matrix(df[col_list])
+    vifs_list = [variance_inflation_factor(vif_matrix,i) for i in range(vif_matrix.shape[1])]
+    # 筛选出vif>10的特征
+    high_vif_col = [i for i,j in zip(col_list,vifs_list) if j > 10]
+    
+    # 根据iv从小到大遍历
+    if len(high_vif_col) > 0:
+        for col in reversed(high_vif_col):
+            col_list.remove(col)
+            vif_matrix = np.matrix(df1[col_list])
+            vifs_list = [variance_inflation_factor(vif_matrix, i) for i in range(vif_matrix.shape[1])]
+            # 当vifs_list中没有>10的时候，停止
+            if len([i for i in vifs_list if i > 10]) == 0:
+                break
+    return col_list
+ 
+
+def forward_pvalue_delete(x,y):
+    '''
+    显著性筛选，向前逐步回归：判断x和y是否有关系。H0：无关，当p-value<0.05时，推翻原假设，即有关
+    https://www.jianshu.com/p/4c9b49878f3d
+    
+    params：
+        x：特征数据集，经WOE变换后，并按iv值从大到小排列 DataFrame
+        y：标签列 Series
+    return：
+        pvalues_col：经限制性检验筛选后的特征集合 list
+    '''
+    col_list = x.columns.tolist()
+    pvalues_col = []
+    # 按iv值大小，逐个引入模型
+    for col in col_list:
+        #print(pvalues_col)
+        pvalues_col.append(col)
+        # 每增加一个特征，做一次显著性检验
+        x_const = sm.add_constant(x.loc[:,pvalues_col])    # 在数据集前加一列全为1的常数项，用于后面的逻辑回归
+        sm_lr = sm.Logit(y, x_const)
+        sm_lr = sm_lr.fit()
+        pvalue = sm_lr.pvalues[col]
+        # 当引入的特征的pvalues>0.05时，不能推翻H0:此特征和y无关，所以去掉
+        if pvalue >= 0.05:
+            pvalues_col.remove(col)
+        #print(pvalues_col)
+    return pvalues_col
+
+
+def backwark_pvalue_delete(x,y):
+    '''
+    显著性筛选，向后逐步回归
+    params：
+        x：特征数据，经过woe变换，并按iv值从大到小排列 DataFrame
+        y：标签列 Series
+    return：
+        high_pvalues_col：经过筛选后的特征集合 list
+    '''
+    # 引所有特征入模，计算显著性
+    x_c = x.copy()
+    
+    x_const = sm.add_constant(x_c)
+    sm_lr = sm.Logit(y, x_const).fit()
+    pvalue_tup = [(i,j) for i,j in zip(sm_lr.pvalues.index, sm_lr.pvalues.values)][1:]  # 第一列是常数项，要去掉
+    delete_count = len([i for i,j in pvalue_tup if j >= 0.05])
+    
+    # 如果有len(pvalues > 0.05) > 0，从iv值小的开始，每次剔除1个pvalue>0.05的；
+    while delete_count > 0:
+        remove_col = [i for i,j in pvalue_tup if j >= 0.05][-1]
+        del x_c[remove_col]    # 删除df中的一列
+        # 再次计算显著性，直至len(pvalues > 0.05) > 0 = False
+        x_const2 = sm.add_constant(x_c)
+        sm_lr2 = sm.Logit(y, x_const2),fit()
+        pvalue_tup2 = [(i,j) for i,j in zip(sm_lr2.pvalues.index, sm_lr2.pvalues.values)][1:]
+        delete_count = len([i for i,j in pvalue_tup2 if j >= 0.05])
+        
+    pvalues_col = x_c.columns.tolist()   
+    
+    return pvalues_col   
+    
+def forward_coef_delet(x,y):
+    '''
+    系数一致筛选：coefficient θ1 ~ θn
+    params：
+        x：特征数据集，经woe变换，且按iv值从大到小排列 DataFrame
+        y：标签数据集 Series
+    return：
+        col_list：经筛选后的特征名
+    '''
+    col_list = x.columns.tolist()    # 对于一维数据来说，tolsit()和list() 一样；二维：https://blog.csdn.net/sinat_28375239/article/details/107849353
+    coef_col = []                                                               #     https://blog.csdn.net/weixin_43188881/article/details/97761669
+    # 按iv值遍历特征名
+    for col in col_list:
+        coef_col.append(col)
+        x2 = x.loc[:,coef_col]
+        sk_lr = LogisticRegression(random_state = 0).fit(x2,y)
+        coef_dict = {k:v for k,v in zip(col_list, sk_lr.coef_[0])}    # sk_lr.coef_ 没有标题(array)，所以创建字典；forward_pvalue_delete中sm_lr.pvalues(Series)有index，不用创建字典
+        # 如果该特征的系数<0，则删除
+        if coef_dict[col] < 0:                                                                      # 注意花括号
+            coef_col.remove(col)
+    
+    return coef_col
+
+def get_map_df(bin_df_list):
+    '''
+    得到特征woe的映射集合表
+    parmas：
+        bin_df_list：所有特征的分箱明细表（bin_df) list
+    return：
+        map_merge_df：经调正后的分箱明细表，并拼接在一起 DataFrame
+    '''
+    map_df_list = []
+    # 遍历每个特征的分箱明细表
+    for dd in bin_df_list:
+        # 重置index，并将原index列重命名为'bin'，在最后增加一列，内容为特征名称
+        map_df = dd.reset_index().assign(col = dd.index.name).rename(columns= {dd.index.name: 'bin'})    # assign(col = ) 这里col是str，但不用加引号
+        # 把特征名称列移动到第一列，方便查看
+        temp_df1 = map_df['col']
+        temp_df2 = map_df.iloc[:,:-1]
+        map_df2 = pd.concat([temp_df1, temp_df2], axis = 1)
+        map_df_list.append(map_df2)
+    map_merge_df = pd.concat(map_df_list, axis = 0)
+    
+    return map_merge_df
+
+def var_mapping(df,map_df,var_map,target):
+    '''
+    woe映射
+    params：
+        df：数据集 DataFrame
+        map_df：woe映射集合表 DataFrame
+        var_map：在map_df中，映射值所在列名，如'woe','socer' string
+        target：数据集中的标签名 string
+    return：
+        df2：映射完毕的数据集 DataFrame
+    '''
+    df2 = df.copy()
+    # 去掉标签字段，遍历特征
+    for col in df2.drop([target],axis = 1).columns:
+        x = df2[col]
+        bin_map = map_df[map_df.col == col]
+        # 新建一个空白array
+        x_res = np.array([0]*x.shape[0], dtype = float)
+        for i in bin_map.index:
+            lower = bin_map['min_bin'][i]
+            upper = bin_map['max_bin'][i]
+            # 离散特征的loewr=upper
+            if lower == upper:
+                x1 =  x[np.where(x == lower)[0]]    # np.where(x == lower)是个tuple，第一个内容才是where的位置信息
+            else:
+                # 连续区间，左开右闭
+                x1 = x[np.where((x>lower)&(x<= upper))[0]]
+            mask = np.in1d(x, x1)
+            x_res[mask] = bin_map[var_map][i]
+        #df2[col] = pd.Series(x_res)    #我的方法
+        
+        x_res = pd.Series(x_res,index=x.index)    # 原文方法，结果一样
+        x_res.name = x.name
+        df2[col] = x_res
+        
+    return df2
+
+def plot_roc(y_label, y_pred):
+    '''
+    绘制roc曲线
+    params：
+        y_label：真实y值 list/array
+        y_pred：预测y值 list/array
+    return：
+        roc曲线
+    '''
+    # 计算tpr，fpr，threshold，AUC
+    tpr,fpr,threshold = metrics.roc_curve(y_label,y_pred)
+    AUC = metrics.roc_auc_score(y_label, y_pred)
+    fig = plt.figure(figsize = (6,4))
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(tpr, fpr, color = 'blue', label = 'AUC=%.3f'%AUC)
+    ax.plot([0,1],[0,1],'r--')
+    ax.set_ylim(0,1)
+    ax.set_xlim(0,1)
+    ax.set_title('ROC')
+    ax.legend(loc = 'best')
+    return plt.show()
+    
+def plot_model_ks(y_label, y_pred):
+    '''
+    绘制ks曲线
+    params：
+        y_label：真实y值 list/array
+        y_pred：预测y值 list/array
+    return：
+        ks曲线
+    '''
+    # 横坐标：pred_bin，纵坐标：bad_rate;good_rate;ks_list
+    pred_list = list(y_pred)
+    label_list = list(y_label)
+    bad = sum(label_list)
+    good = len(label_list) - bad
+    
+    step = (max(pred_list) - min(pred_list)) / 200
+    items = sorted(zip(label_list, pred_list), key = lambda x: x[1])
+    
+    pred_bin = []
+    bad_rate = []
+    good_rate = []
+    ks_list = []
+    
+    for i in range(1,201):
+        idx = min(pred_list) + i*step
+        label_bin = [x[0] for x in items if x[1]< idx]
+        bad_bin = sum(label_bin)
+        good_bin = len(label_bin) - bad_bin
+        badrate = bad_bin / bad
+        goodrate = good_bin / good
+        ks = abs(badrate - goodrate)
+        pred_bin.append(idx)
+        bad_rate.append(badrate)
+        good_rate.append(goodrate)
+        ks_list.append(ks)
+        
+    
+    fig = plt.figure(figsize = (6,4))
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(pred_bin,bad_rate,color = 'red',label = 'bad_rate')
+    ax.plot(pred_bin,good_rate,color = 'green', label = 'good_rate')
+    ax.plot(pred_bin,ks_list,color = 'blue',label = 'ks')
+    ax.set_title('KS:{:3f}'.format(max(ks_list)))
+    ax.legend(loc = 'best')
+    return plt.show(ax)
+        
+    
+    
+def cal_scale(score, odds, PDO, model):
+    '''
+    计算评分模型参数
+    params:
+        score: 平均分(在odds下的分数) int
+        odds：设定的坏好比 float
+        POD: odds翻倍后，增加的分数 int
+        model：预测模型
+    return：
+        A：线性方程的截距
+        B：线性方程的系数
+        base_score：当ln(odds)为θ0时的基础分
+    '''
+    B = PDO / np.log(2)
+    A = score - B * np.log(odds)
+    base_score = A - B * model.intercept_[0]
+    return A,B,base_score
+    
+def get_score_map(woe_df,coef_dict,B):
+    '''
+    计算各特征，各分箱对应的score
+    params：
+        woe_df：woe映射列表 DataFrame
+        coef_dict：{特征名：系数θi} dict
+        B：评分模型中的系数
+    return：
+        score_df：特征分箱映射表 DataFrame
+    '''
+    
+    scores = []
+    for col in woe_df.col.unique():
+        woe_list = woe_df[woe_df.col == col]['woe'].tolist()
+        coef = coef_dict[col]
+        score = [round(coef * B * x,0) for x in woe_list]
+        scores.extend(score)
+    woe_df['score'] = scores
+    score_df = woe_df.copy()
+    return score_df
+    
+def plot_score_hist(data, target, score_col, title, plt_size = None):
+    '''
+    绘制好坏用户得分分布图
+    params：
+        data：映射评分后的数据集 DataFrame
+        target：标签名 string
+        score_col：分数所在列名 string
+        title：分布图标题 string
+        plt_size：分布图大小
+    return：
+        分布图
+    '''
+    plt.figure(figsize = plt_size)
+    plt.title(title)
+    x1 = data[data.target == 1][score_col]
+    x2 = data[data.target == 0][score_col]
+    sns.kdeplot(x1,shade = True,label='bad',color='hotpink')
+    sns.kdeplot(x2,shade = True, label='good',color='seagreen')
+    plt.legend()
+    return plt.show()
+
+def cal_psi(df1, df2, col, max_bin = 5):
+    '''
+    计算psi，用于筛选特征是否稳定，数值越大越不稳定
+    params：
+        df1：训练集 DataFrame
+        df2：测试集 DataFrame
+        col：需要计算的特征名 str
+        max_bin：最大分箱数 int
+    return：
+        psi：该特征名的psi值 float
+        bin_df：psi明细表 DataFrame
+    '''
+    # 离散型
+    if df1[col].dtype == np.dtype('object') or df1[col].dtype == np.dtype('bool') or df1[col].nunique() <= max_bin:
+        bin_df1 = df1[col].value_counts().to_frame().reset_index().rename(columns = {'index':col,col:'total_A'})
+        bin_df1['totalrate_A'] = bin_df1['total_A'] / df1.shape[0]
+        bin_df2 = df2[col].value_counts().to_frame().reset_index().rename(columns = {'index':col,col:'total_B'})
+        bin_df2['totalrate_B'] = bin_df2['total_B'] / df2.shape[0]
+        
+    # 连续型
+    else:
+        bin_series, bin_cut = pd.qcut(df1[col],q = max_bin, retbins = True, duplicates = 'drop')
+        # 更改切割左右界限
+        bin_cut[0] = float('-inf')
+        bin_cut[-1] = float('inf')
+        
+        # 按照新的bin_cut重新分箱
+        bucket1 = pd.cut(df1[col],bins = bin_cut)
+        bin_df1 = pd.DataFrame()
+        group1 =  df1.groupby(bucket1)    
+        bin_df1['total_A'] = group1[col].count()    # 离散型有这一列，连续型也加上，统一格式
+        bin_df1['totalrate_A'] = bin_df1['total_A'] / df1.shape[0]    # index = bin_cut
+        bin_df1 = bin_df1.reset_index()    # reset后，第一列名：col，内容：bin_cut
+        
+        bucket2 = pd.cut(df2[col],bins = bin_cut)
+        bin_df2 = pd.DataFrame()
+        group2 =  df2.groupby(bucket2)
+        bin_df2['total_B'] = group2[col].count()
+        bin_df2['totalrate_B'] = bin_df2['total_B'] / df2.shape[0]
+        bin_df2 = bin_df2.reset_index()
+    
+    # 计算psi
+    bin_df = pd.merge(bin_df1,bin_df2,on = col)
+    bin_df['a'] = bin_df['totalrate_B'] - bin_df['totalrate_A']
+    bin_df['b'] = np.log(bin_df['totalrate_B'] / bin_df['totalrate_A'])
+    bin_df['Index'] = bin_df['a'] * bin_df['b']
+    bin_df['psi'] = bin_df['Index'].sum()
+    bin_df = bin_df.drop(['a','b'], axis = 1)
+    
+    psi = bin_df.psi.iloc[0]
+    return psi, bin_df
+  
+def get_scorecard_model(train_data,test_data,target,nan_value=-999,score=400,odds=900/1,pdo=20):
+    '''
+    评分卡建模
+    parmas：
+        train_data：预处理过的数据集 DataFrame
+        test_data：预处理过的测试集 DataFrmae
+        target：标签列名 str
+        nan_value：缺失映射值 int 默认-999
+        odds：设定的坏好比 float 默认900/1
+        score：在这个odds下的分数 int 默认400
+        pdo：好坏翻倍比 int 默认20
+    return：
+        lr_model：lr模型
+        map_：woe，score映射表 DataFrame
+        train_score：训练集模型分表 DataFrame
+        test_score：测试集模型分表 DataFrame
+    '''
+    # psi删选，剔除psi>0.25（不稳定）的特征
+    all_col = [x for x in train_data.columns if x != target]
+    psi_delete = []
+    for col in all_col:
+        psi, psi_bin_df = cal_psi(train_data, test_data, col)
+        if psi >= 0.25:
+            psi_delete.append(col)
+    train = train_data.drop(psi_delete, axis = 1)
+    print(train.shape)
+    print(psi_delete)
+    print('psi筛选特征完成')
+    print('------------')
+    
+    # 特征分箱，默认决策树分箱
+    train_col = [x for x in train.columns if x != target]
+    bin_df_list = []
+    cut_list = []
+    for col in train_col:
+        try:
+            bin_df, cut = binning_var(train,col,target)
+            bin_df_list.append(bin_df)
+            cut_list.append(cut)
+        except:
+            pass
+    print('len(cut_list){}'.format(len(cut_list)))
+    print('特征分箱完成')
+    print('------------')
+    
+    
+    # 根据iv筛选特征：剔除无限大，取大于0.2的
+    bin_df_tup = [(x,y) for x,y in zip(bin_df_list,cut_list) if x.iv.iloc[0] != float('inf')]
+    bin_df_list = [x for x,y in bin_df_tup]
+    cut_list = [y for x,y in bin_df_tup]
+    # 保留每个特征名 + 分割点
+    cut_dict = {}
+    for dd,cc in bin_df_tup:
+        col = dd.index.name    # index是切分点列，index.name是特征名
+        cut_dict[col] = cc
+    
+    # 特征名 + iv值按大小排序
+    iv_col = [x.index.name for x,y in bin_df_tup]
+    iv_value = [x.iv.iloc[0] for x,y in bin_df_tup]
+    iv_sort = sorted(zip(iv_col,iv_value),key = lambda x: x[1], reverse = True)
+    #print('iv_sort:{}'.format(iv_sort))
+        
+    # 选取iv大于0.2的特征名
+    iv_select_col = [x for x, y in iv_sort if y > 0.02]
+    print(len(iv_select_col))
+    print('iv筛选完成')
+    print('------------')
+    
+    # 特征分类：离散 + 连续
+    cate_col = []
+    num_col = []
+    for col in iv_select_col:
+        if train[col].dtype == np.dtype('object') or train[col].dtype == np.dtype('bool') or train[col].nunique() <= 5:
+            cate_col.append(col)
+        else:
+            num_col.append(col)
+    #print(cate_col)
+    #print(num_col)
+    
+    # 先筛选连续变量
+    # 相关性筛选，相关系数阈值0.65
+    corr_select_col = forward_corr_delete(train, num_col)
+    #print(corr_select_col)
+    print(len(corr_select_col))
+    print('相关性筛选完成')
+    print('------------')
+    
+    # 多重共线性筛选，阈值10
+    vif_select_col = vif_delete(train, corr_select_col)
+    #print(vif_select_col)
+    print(len(vif_select_col))
+    print('多重共线性筛选完成')
+    print('------------')
+    
+    # 自动调整单调分箱
+    trim_cut_dict = {k:v for k,v in cut_dict.items() if k in vif_select_col}
+    trim_bin_list = []
+    #print(trim_cut_dict)
+    for col in tqdm(trim_cut_dict.keys()):    # tqdm：terminal终端进度条
+        bin_cut = trim_cut_dict[col]
+        bin_df = [x for x in bin_df_list if x.index.name == col][0]
+        #print(bin_df)
+        #print(bin_cut)
+        if nan_value in bin_cut:
+            woe_list = bin_df['woe'].tolist()[1:]
+        else:
+            woe_list = bin_df['woe'].tolist()
+        #print('bin_cut:{}'.format(bin_cut))
+        #print('woe_list[0] > 0:{}'.format(woe_list[0] > 0))
+        
+        if not judge_increasing(woe_list) and not judge_decreasing(woe_list):
+            monot_cut = monot_trim(train, col, target, nan_value = nan_value, cut = bin_cut)
+            monot_bin_df = binning_trim(train, col, target, cut=monot_cut, right_border = True)
+            trim_bin_list.append(monot_bin_df)
+        else:
+            trim_bin_list.append(bin_df)
+    #print('trim_bin_list:{}'.format(trim_bin_list))
+            
+    
+    # 再根据iv > 0.02筛选一遍
+    select_bin_list = []
+    for bin_df in trim_bin_list:
+        if bin_df.iv.iloc[0] >= 0.02:
+            select_bin_list.append(bin_df)
+    #print(select_bin_list)
+    print('自动调整分箱完成')
+    print('------------')
+    
+    # 连续性特征的woe映射集合表
+    woe_map_num = get_map_df(select_bin_list)
+    woe_map_num['bin'] = woe_map_num['bin'].map(lambda x: str(x))    # type(woe_map_num.bin.iloc[0])=pandas._libs.interval.Interval，一种数据类型：区间
+    woe_map_num['min_bin'] = woe_map_num['bin'].map(lambda x:x.split(',')[0][1:])    # '(-inf, 2.5]' → '(-inf'→ '-inf'
+    woe_map_num['max_bin'] = woe_map_num['bin'].map(lambda x:x.split(',')[1][:-1])    # '(-inf, 2.5]' → '2.5]'→ '2.5'
+    woe_map_num['min_bin'] = woe_map_num['min_bin'].map(lambda x:float(x))
+    woe_map_num['max_bin'] = woe_map_num['max_bin'].map(lambda x:float(x))
+    #print(woe_map_num)
+    
+    # 再筛选离散变量
+    # 剔除woe不单调的
+    if len(cate_col) > 0:
+        #print(cate_col)
+        bin_cate_list = [x for x in bin_df_list if x.index.name in cate_col]
+        select_df = []
+        for bin_df in bin_cate_list:
+            woe_list = bin_df['woe'].tolist()
+            if judge_decreasing(woe_list) or judge_increasing(woe_list):
+                select_df.append(bin_df)
+                
+        # 离散特征的woe映射集合表增加min_bin和max_bin
+        if len(select_df) > 0:
+            woe_map_cate = get_map_df(select_df)
+            woe_map_cate['min_bin'] = list(woe_map_cate['bin'])
+            woe_map_cate['max_bin'] = list(woe_map_cate['bin'])
+            woe_map_df = pd.concat([woe_map_num, woe_map_cate],axis = 0).reset_index(drop= True)
+    else:
+        woe_map_df = woe_map_num.reset_index(drop = True)
+    
+    # 把选出来的特征名，按照iv从大到小排序
+    select_all_col = woe_map_df['col'].unique().tolist()
+    select_sort_col = [x for x,y in iv_sort if x in select_all_col]
+    # 这里的train2，特征按照iv从大到小排列
+    train2 = train.loc[:,select_sort_col + [target]].reset_index(drop=True)
+    
+    # woe 映射
+    train_woe = var_mapping(train2,woe_map_df,'woe',target)
+    
+    # 显著性筛选
+    x = train_woe.loc[:, select_sort_col]
+    y = train_woe[target]
+    pvalue_select_col = forward_pvalue_delete(x,y)
+    print(len(pvalue_select_col))
+    print(pvalue_select_col)
+    print('显著性筛选完成')
+    print('-----------')
+    
+    # 系数筛选，剔除系数为负数的特征
+    x2 = x.loc[:,pvalue_select_col]
+    coef_select_col = forward_coef_delet(x2,y)
+    print(len(coef_select_col))
+    print(coef_select_col)
+    print('系数一致筛选完成')
+    print('-----------')
+    
+    # LR建模
+    x3 = x2.loc[:, coef_select_col]
+    # 划分train和cv
+    train_x, valid_x, train_y, valid_y = train_test_split(x3, y, test_size = 0.2, random_state = 0)
+    # 保存cv的index
+    valid_index = valid_x.index.tolist()
+    # 建模
+    lr_model = LogisticRegression(C = 1.0).fit(train_x, train_y)    # C正则化系数的倒数
+    # 保存系数
+    lr_coef_dict = {k:v for k,v in zip(train_x.columns, lr_model.coef_[0])}
+    print(lr_coef_dict)
+    print('建模完成')
+    print('------------')
+    
+    # 绘制验证集的auc，ks
+    valid_pre = lr_model.predict_proba(valid_x)[:,1]
+    print('验证集的AUC,KS:')
+    plot_roc(valid_y,valid_pre)
+    plot_model_ks(valid_y,valid_pre)
+    
+    # 绘制测试集的auc，ks
+    woe_map_df2 = woe_map_df[woe_map_df.col.isin(coef_select_col)].reset_index(drop = True)
+    test = test_data.loc[:,coef_select_col + [target]].reset_index(drop = True)
+    
+    
+    test_woe = var_mapping(test,woe_map_df2,'woe',target)
+    test_x = test_woe.drop([target],axis = 1)
+    test_y = test_woe[target]
+    test_pre = lr_model.predict_proba(test_x)[:,1]
+    print('测试集的AUC，KS：')
+    plot_roc(test_y, test_pre)
+    plot_model_ks(test_y, test_pre)
+    
+    # 计算评分卡参数
+    A,B,base_score = cal_scale(score, odds, pdo, lr_model)
+    print(A,B,base_score)
+    
+
+    # 计算特征分箱的score
+    score_map_df = get_score_map(woe_map_df2,lr_coef_dict,B)
+    print(score_map_df)
+    
+    # 分数映射
+    valid_data = train2.iloc[valid_index,:].loc[:,coef_select_col + [target]].reset_index(drop=True)
+    valid_score = var_mapping(valid_data, score_map_df,'score',target)
+    valid_score['final_score'] = base_score
+    for col in coef_select_col:
+        valid_score['final_score'] -= valid_score[col]
+    valid_score['final_score'] = valid_score['final_score'].map(lambda x: int(x))    
+    
+        
+    test_score = var_mapping(test, score_map_df, 'score', target)
+    test_score['final_score'] = base_score
+    for col in coef_select_col:
+        test_score['final_score'] -= test_score[col]
+    test_score['final_score'] = test_score['final_score'].map(lambda x: int(x))
+    
+    print('评分转换完成')
+    print('------------')
+    
+    # 验证集的评分分布
+    plot_score_hist(valid_score,target,'final_score','valid_score',plt_size = (6,4))
+    
+    # 测试集的评分分布
+    plot_score_hist(test_score,target,'final_score','test_score',plt_size=(6,4))    
+    return lr_model,score_map_df,valid_score,test_score,valid_pre,A,B
